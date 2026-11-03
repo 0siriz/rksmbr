@@ -18,6 +18,8 @@ import subprocess
 from dataclasses import dataclass
 from typing import List, Dict, Any
 
+from bitonic_revote import Ballot, resolve_revoting, print_sort_audit, demo
+
 # ==============================================================================
 # HELPER FUNCTIONS 
 # ==============================================================================
@@ -97,7 +99,7 @@ class VoterClient:
         ).hexdigest()
         return int(digest[:8], 16)
 
-    def generate_submission(self, tamper_ballot: bool = False) -> Dict[str, Any]:
+    def generate_submission(self, tamper_ballot: bool = False, is_legit: bool = True) -> Dict[str, Any]:
         blinding_nonce = secrets.token_hex(16)
         nullifier = self.derive_nullifier()
         witness = (
@@ -133,7 +135,8 @@ class VoterClient:
 
         return {
             "zk_proof": proof,
-            "one_hot_vote": submitted_vote
+            "one_hot_vote": submitted_vote,
+            "is_legit": is_legit
         }
 
 class PreMPCGateway:
@@ -163,6 +166,15 @@ class PreMPCGateway:
             
         # 4. Age verification check
         return proof.disclosed_is_over_18 is True
+    
+def independent_revote_reference(ballots: List[Ballot]):
+    """Simple dictionary baseline, deliberately independent of bitonic sorting."""
+    latest = {}
+    for ballot in ballots:
+        if ballot.is_legit and (ballot.nullifier not in latest or
+                               ballot.sequence_number > latest[ballot.nullifier].sequence_number):
+            latest[ballot.nullifier] = ballot
+    return latest
 
 # ==============================================================================
 # MAIN EXPERIMENT
@@ -180,55 +192,93 @@ def main():
     gateway = PreMPCGateway(issuer, ELECTION_ID)
 
     submissions = []
+    credentials_by_user = {}
+    original_choice_by_user = {}
     for i in range(M_TOTAL_USERS):
         age = 16 if (i % 10 == 0) else secrets.randbelow(50) + 18
         cred = issuer.issue_credential(f"DK-ID-{i:04d}", age, ELECTION_ID)
+        credentials_by_user[i] = cred
         choice = secrets.randbelow(K_CANDIDATES)
+        original_choice_by_user[i] = choice
         client = VoterClient(cred, choice, K_CANDIDATES)
         
         # Introduce a MITM attack simulation for user 1 (tampered ballot)
         tamper = (i == 1)
         submissions.append(client.generate_submission(tamper_ballot=tamper))
+    
+    # TEST REVOTES: same credential => same nullifier. Each changes candidate.
+    # #2 and #3 are adults and were not tampered with in the original loop.
+    for i in (2, 3):
+        new_choice = (original_choice_by_user[i] + 1) % K_CANDIDATES
+        submissions.append(VoterClient(credentials_by_user[i], new_choice, K_CANDIDATES)
+                           .generate_submission(is_legit=True))
+        print(f"[TEST REVOTE] Voter {i}: candidate {original_choice_by_user[i]} -> {new_choice}")
+
+    # TEST DECOY: sent after voter's real revote. This must NOT replace the real one.
+    decoy_choice = (original_choice_by_user[2] + 2) % K_CANDIDATES
+    submissions.append(VoterClient(credentials_by_user[2], decoy_choice, K_CANDIDATES)
+                       .generate_submission(is_legit=False))
+    print(f"[TEST DECOY] Voter 2: later decoy for candidate {decoy_choice} (is_legit=False)")
 
     start_zk = time.perf_counter()
-    admitted_one_hot_votes = []
+    admitted_ballots = []
     rejected_count = 0
-    
-    for idx, sub in enumerate(submissions):
-        if gateway.verify(sub):
-            admitted_one_hot_votes.append(sub["one_hot_vote"])
+    for sequence_number, submission in enumerate(submissions):
+        if gateway.verify(submission):
+            proof = submission["zk_proof"]
+            admitted_ballots.append(Ballot(
+                nullifier=proof.nullifier,
+                sequence_number=sequence_number,
+                is_legit=submission["is_legit"],
+                one_hot=tuple(submission["one_hot_vote"]),
+            ))
         else:
             rejected_count += 1
-            if idx == 1:
+            if sequence_number == 1:
                 print("[SECURITY ALERT] MitM attack detected and blocked on Voter 1 (tampered ballot).")
-                
+
     zk_elapsed_ms = (time.perf_counter() - start_zk) * 1000.0
-    m_admitted = len(admitted_one_hot_votes)
+    m_admitted = len(admitted_ballots)
 
     print(f"\n--- PRE-MPC ZK GATEWAY ---")
-    print(f"Total submissions: {M_TOTAL_USERS} | Admitted adults: {m_admitted} | Rejected: {rejected_count}")
+    print(f"Total submissions: {len(submissions)} | Admitted adults: {m_admitted} | Rejected: {rejected_count}")
     print(f"Total ZK Verification Time: {zk_elapsed_ms:.2f} ms")
 
+    result = resolve_revoting(admitted_ballots, K_CANDIDATES)
+    # Display meaningful voter labels only for these synthetic test users.
+    labels = {VoterClient(credentials_by_user[i], 0, K_CANDIDATES).derive_nullifier():
+              f"Voter {i}" for i in (2, 3)}
+    print_sort_audit(result, show_all=False, demo_labels=labels)
+
+    # Cross-check independently, not with the sorting implementation.
+    reference = independent_revote_reference(admitted_ballots)
+    assert {b.nullifier: b.sequence_number for b in result.selected} == {
+        nullifier: b.sequence_number for nullifier, b in reference.items()
+    }, "ERROR: bitonic revote selection disagrees with independent baseline"
+
+    counted_votes = [list(b.one_hot) for b in result.selected]
+    m_counted = len(counted_votes)      
     print("\n--- IDEAL WORLD BASELINE ---")
-    ideal_tally = ideal_tally_votes(admitted_one_hot_votes, K_CANDIDATES)
-    ideal_pct = vote_percentages(ideal_tally, m_admitted, K_CANDIDATES)
+    ideal_tally = ideal_tally_votes(counted_votes, K_CANDIDATES)
+    ideal_pct = vote_percentages(ideal_tally, m_counted, K_CANDIDATES)
     print(f"Ideal World Tally:       {ideal_tally}")
     print(f"Ideal World Percentages: {ideal_pct}%")
+    assert ideal_tally == result.tally, "ERROR: Tally mismatch"
 
     os.makedirs("Player-Data", exist_ok=True)
     input_file = "Player-Data/Input-P0-0"
     with open(input_file, "w") as f:
-        for vec in admitted_one_hot_votes:
+        for vec in counted_votes:
             f.write(" ".join(map(str, vec)) + "\n")
 
     print("\n--- REAL MP-SPDZ DISTRIBUTED EXECUTION ---")
     # Calling compilation with proper parameters
-    compile_cmd = ["./compile.py", MPC_PROGRAM, str(m_admitted), str(K_CANDIDATES)]
+    compile_cmd = ["./compile.py", MPC_PROGRAM, str(m_counted), str(K_CANDIDATES)]
     subprocess.run(compile_cmd, check=True)
 
     # Executing the semi-honest protocol
-    run_cmd = ["./Scripts/semi.sh", f"{MPC_PROGRAM}-{m_admitted}-{K_CANDIDATES}", "-N", str(N_SERVERS)]
-    subprocess.run(run_cmd, check=True)
+    run_cmd = ["./Scripts/semi.sh", f"{MPC_PROGRAM}-{m_counted}-{K_CANDIDATES}", "-N", str(N_SERVERS)]
+    subprocess.run(run_cmd, check=True, env={**os.environ, "PLAYERS": str(N_SERVERS)})
 
 if __name__ == "__main__":
     main()

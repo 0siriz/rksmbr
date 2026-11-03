@@ -20,7 +20,7 @@ else:
 tally = Array(K_CANDIDATES, sint)
 tally.assign_all(0)
 
-print_ln('--- Starting One-Hot MPC Tallying (Admitted Voters M=%s, Candidates K=%s) ---', M_VOTERS, K_CANDIDATES)
+print_ln('--- Starting One-Hot MPC Tallying (Counted Voters M=%s, Candidates K=%s) ---', M_VOTERS, K_CANDIDATES)
 
 @for_range(M_VOTERS)
 def _(voter_idx):
